@@ -1,0 +1,398 @@
+# CloudFormation-IaC-
+
+# AWS CloudFormation Template: INSTRUMENTED Production-Grade 3-Tier Web Application
+# Author: Gemini (Modified by a Data Engineer)
+# Date: 2025-09-30
+# Description:
+# This template provisions a highly available 3-tier web application AND the
+# surrounding data collection infrastructure. It adds VPC Flow Logs, ELB Access Logs,
+# enhanced monitoring, centralized logging, and an analytics layer with AWS Glue and Athena.
+
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  EnvironmentName:
+    Description: An environment name that will be prefixed to resource names (e.g., prod, dev).
+    Type: String
+    Default: "prod"
+  
+  VpcCIDR:
+    Description: The CIDR block for the VPC.
+    Type: String
+    Default: "10.0.0.0/16"
+
+  WebServerInstanceType:
+    Description: The EC2 instance type for the web servers.
+    Type: String
+    Default: "t3.micro"
+
+  DBInstanceClass:
+    Description: The instance class for the RDS database.
+    Type: String
+    Default: "db.t3.micro"
+  
+  DBMasterUsername:
+    Description: The master username for the RDS database.
+    Type: String
+    NoEcho: true
+  
+  DBMasterPassword:
+    Description: The master password for the RDS database.
+    Type: String
+    NoEcho: true
+    MinLength: 8
+
+Mappings:
+  # Region-to-AMI mapping for Amazon Linux 2
+  RegionMap:
+    us-east-1:
+      AMI: "ami-0c55b159cbfafe1f0"
+    us-west-2:
+      AMI: "ami-0892d3c7ee95c038d"
+    eu-west-1:
+      AMI: "ami-047bb4163c506cd98"
+
+Resources:
+  # =================================================================
+  # DATA COLLECTION & ANALYTICS LAYER (Data Engineer's Additions)
+  # =================================================================
+  LogsS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${aws::accountid}-${aws::region}-${environmentname}-logs"
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      LifecycleConfiguration:
+        Rules:
+          - Id: LogRetentionRule
+            Status: Enabled
+            ExpirationInDays: 365 # Keep logs for one year
+
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: glue.amazonaws.com}, Action: sts:AssumeRole}]
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole"
+      Policies:
+        - PolicyName: S3AccessForGlue
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ["s3:GetObject", "s3:ListBucket"]
+                Resource: [!GetAtt LogsS3Bucket.Arn, !Sub "${LogsS3Bucket.Arn}/*"]
+
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${EnvironmentName}-AnalyticsWorkgroup"
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${LogsS3Bucket}/athena-query-results/"
+
+  # =================================================================
+  # NETWORK LAYER (Modified by Data Engineer)
+  # =================================================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-VPC"
+
+  # --- Data Engineer Addition: VPC Flow Logs ---
+  VPCFlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: vpc-flow-logs.amazonaws.com}, Action: sts:AssumeRole}]
+  
+  VPCFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref VPC
+      TrafficType: ALL
+      LogDestinationType: s3
+      LogDestination: !GetAtt LogsS3Bucket.Arn
+      DeliverLogsPermissionArn: !GetAtt VPCFlowLogRole.Arn
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ... (Subnets and Routing remain the same) ...
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [0, !Cidr [!GetAtt VPC.CidrBlock, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [1, !Cidr [!GetAtt VPC.CidrBlock, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [2, !Cidr [!GetAtt VPC.CidrBlock, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [3, !Cidr [!GetAtt VPC.CidrBlock, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs '']
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+  # =================================================================
+  # SECURITY LAYER (Largely the same, roles added for new services)
+  # =================================================================
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: "Allow HTTP traffic from the internet to the load balancer"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+  
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: "Allow HTTP traffic from the load balancer and internal SSH"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: "Allow database connections from the web servers"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432 # Port for PostgreSQL
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref WebServerSecurityGroup
+
+  # =================================================================
+  # APPLICATION & COMPUTE LAYER (Modified by Data Engineer)
+  # =================================================================
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets: [!Ref PublicSubnet1, !Ref PublicSubnet2]
+      SecurityGroups: [!Ref LoadBalancerSecurityGroup]
+      # --- Data Engineer Addition: Enable Access Logs ---
+      LoadBalancerAttributes:
+        - Key: access_logs.s3.enabled
+          Value: "true"
+        - Key: access_logs.s3.bucket
+          Value: !Ref LogsS3Bucket
+        - Key: access_logs.s3.prefix
+          Value: "elb-access-logs"
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VPC
+      Port: 80
+      Protocol: "HTTP"
+      HealthCheckPath: "/"
+      TargetType: instance
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: "HTTP"
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+  
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: sts:AssumeRole}]
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy" # Allows writing logs & metrics
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref EC2InstanceRole]
+
+  WebServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${EnvironmentName}-WebServer-Template"
+      LaunchTemplateData:
+        InstanceType: !Ref WebServerInstanceType
+        ImageId: !FindInMap [!Ref "AWS::Region", AMI]
+        SecurityGroupIds: [!Ref WebServerSecurityGroup]
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        # --- Data Engineer Tweak: Install and configure CloudWatch Agent ---
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            yum update -y
+            # Install web server and CloudWatch agent
+            yum install -y httpd php php-mysql amazon-cloudwatch-agent
+            
+            # Configure CloudWatch Agent to collect system metrics and web server logs
+            cat <<'EOF' > /opt/aws/amazon-cloudwatch-agent/bin/config.json
+            {
+              "agent": { "metrics_collection_interval": 60, "run_as_user": "root" },
+              "metrics": {
+                "metrics_collected": {
+                  "mem": { "measurement": ["mem_used_percent"] },
+                  "disk": { "measurement": ["disk_used_percent"], "resources": ["/"] }
+                }
+              },
+              "logs": {
+                "logs_collected": {
+                  "files": {
+                    "collect_list": [
+                      {
+                        "file_path": "/var/log/httpd/access_log",
+                        "log_group_name": "${EnvironmentName}-httpd-access-log",
+                        "log_stream_name": "{instance_id}"
+                      },
+                      {
+                        "file_path": "/var/log/httpd/error_log",
+                        "log_group_name": "${EnvironmentName}-httpd-error-log",
+                        "log_stream_name": "{instance_id}"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+            EOF
+            
+            # Start the agent and web server
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/bin/config.json -s
+            systemctl start httpd
+            systemctl enable httpd
+            echo "Health check OK" > /var/www/html/index.html
+  
+  WebServerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebServerLaunchTemplate
+        Version: !GetAtt WebServerLaunchTemplate.LatestVersionNumber
+      MinSize: "2"
+      MaxSize: "4"
+      DesiredCapacity: "2"
+      TargetGroupARNs: [!Ref ALBTargetGroup]
+      Policies:
+        - PolicyName: "CPU-Scaling-Policy"
+          PolicyType: "TargetTrackingScaling"
+          TargetTrackingConfiguration:
+            PredefinedMetricSpecification:
+              PredefinedMetricType: "ASGAverageCPUUtilization"
+            TargetValue: 60.0
+
+  # =================================================================
+  # DATA LAYER (Modified by Data Engineer)
+  # =================================================================
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: "Subnet group for the RDS instance"
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      
+  PrimaryDBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub "${EnvironmentName}-primary-db"
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: "postgres"
+      EngineVersion: "13.3"
+      AllocatedStorage: "20"
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups: [!Ref DatabaseSecurityGroup]
+      MasterUsername: !Ref DBMasterUsername
+      MasterUserPassword: !Ref DBMasterPassword
+      MultiAZ: true
+      PubliclyAccessible: false
+      StorageType: "gp2"
+      # --- Data Engineer Additions: Enhanced Monitoring and Log Exports ---
+      MonitoringInterval: 60 # Enable Enhanced Monitoring
+      MonitoringRoleArn: !GetAtt RDSEnhancedMonitoringRole.Arn
+      EnableCloudwatchLogsExports:
+        - "postgresql"
+        - "upgrade"
+
+  RDSEnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: monitoring.rds.amazonaws.com}, Action: sts:AssumeRole}]
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
+
+Outputs:
+  ApplicationURL:
+    Description: "The URL of the web application"
+    Value: !Sub "http://${ApplicationLoadBalancer.DNSName}"
+
+
+I have used Cloud formation for configuring glue crawler to update glue catalog in specific data on row level which is not available out of the box from AWS pre defined. 
+defining VPC on particular sites, IAM roles, ACL blocking on IP addresses, assigning 
+
